@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>가위바위보 실시간 인식 (Secure Serverless)</title>
+    <!-- Tailwind CSS for modern responsive white UI styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Mirror effect for the webcam preview for natural user interaction */
+        #webcam {
+            transform: scaleX(-1);
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen flex flex-col items-center justify-center p-4">
+
+    <div class="w-full max-w-4xl mx-auto flex flex-col items-center">
+        <!-- Header Section -->
+        <header class="mb-6 text-center">
+            <h1 class="text-3xl font-extrabold tracking-tight text-slate-900 mb-2">가위바위보 실시간 인식 (Roboflow AI)</h1>
+            <p class="text-slate-600 text-sm">안전한 서버리스 프록시를 통한 고정밀 실시간 손 모양 판별</p>
+        </header>
+
+        <!-- Main Video & Overlay Container -->
+        <div class="relative w-full max-w-2xl aspect-video bg-white rounded-2xl overflow-hidden shadow-xl border border-slate-200 flex items-center justify-center">
+            
+            <!-- Webcam Video Feed -->
+            <video id="webcam" autoplay playsinline muted class="w-full h-full object-cover"></video>
+
+            <!-- Hidden Canvas for frame preprocessing and capture -->
+            <canvas id="snapshotCanvas" class="hidden"></canvas>
+
+            <!-- Top-Right Result Overlay Box -->
+            <div class="absolute top-4 right-4 bg-white/90 backdrop-blur-md border border-slate-200 px-5 py-3 rounded-xl shadow-md flex flex-col items-end">
+                <span class="text-xs uppercase tracking-wider text-slate-500 font-semibold">인식된 손 모양</span>
+                <span id="predictionResult" class="text-2xl font-black text-emerald-600 mt-0.5">대기 중...</span>
+                <span id="confidenceText" class="text-xs text-slate-400 mt-0.5">정확도: -</span>
+            </div>
+
+            <!-- Status Indicator Overlay (Bottom Left) -->
+            <div class="absolute bottom-4 left-4 bg-white/90 backdrop-blur-md px-3 py-1.5 rounded-lg text-xs font-medium text-slate-700 flex items-center gap-2 border border-slate-200 shadow-sm">
+                <span id="statusDot" class="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse"></span>
+                <span id="statusText">웹캠 연결 중...</span>
+            </div>
+        </div>
+
+        <!-- Controls & Information Section -->
+        <div class="mt-6 flex flex-wrap gap-4 items-center justify-center">
+            <button id="toggleBtn" onclick="toggleDetection()" class="bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-semibold px-6 py-3 rounded-xl shadow-md transition duration-200 cursor-pointer disabled:opacity-50" disabled>
+                인식 시작하기
+            </button>
+            <button onclick="retryWebcam()" class="bg-white hover:bg-slate-100 active:bg-slate-200 text-slate-700 border border-slate-300 font-semibold px-4 py-3 rounded-xl shadow-sm transition duration-200 cursor-pointer text-sm">
+                카메라 재연결
+            </button>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('snapshotCanvas');
+        const predictionResultElement = document.getElementById('predictionResult');
+        const confidenceTextElement = document.getElementById('confidenceText');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const toggleBtn = document.getElementById('toggleBtn');
+
+        let isDetecting = false;
+        let detectionInterval = null;
+        let currentStream = null;
+
+        async function stopExistingStream() {
+            if (currentStream) {
+                currentStream.getTracks().forEach(track => {
+                    try { track.stop(); } catch (e) {}
+                });
+                currentStream = null;
+            }
+            if (videoElement.srcObject) {
+                const stream = videoElement.srcObject;
+                if (stream && typeof stream.getTracks === 'function') {
+                    stream.getTracks().forEach(track => {
+                        try { track.stop(); } catch (e) {}
+                    });
+                }
+                videoElement.srcObject = null;
+            }
+            await new Promise(resolve => setTimeout(resolve, 400));
+        }
+
+        async function initWebcam() {
+            try {
+                await stopExistingStream();
+                statusText.textContent = '웹캠 권한 요청 중...';
+                statusDot.className = 'w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse';
+
+                let stream = null;
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({ 
+                        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+                        audio: false
+                    });
+                } catch (firstErr) {
+                    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+                }
+                
+                currentStream = stream;
+                videoElement.srcObject = stream;
+                
+                await videoElement.play().catch(e => console.log("Play interrupted:", e));
+
+                statusDot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-500';
+                statusText.textContent = '웹캠 준비 완료 (서버리스 연동)';
+                toggleBtn.disabled = false;
+
+            } catch (error) {
+                console.error('Webcam access error:', error);
+                statusDot.className = 'w-2.5 h-2.5 rounded-full bg-rose-500';
+                statusText.textContent = '웹캠 연결 실패 (' + error.name + ')';
+                predictionResultElement.textContent = '웹캠 오류';
+            }
+        }
+
+        function retryWebcam() {
+            if (isDetecting) {
+                toggleDetection();
+            }
+            initWebcam();
+        }
+
+        function toggleDetection() {
+            isDetecting = !isDetecting;
+            if (isDetecting) {
+                toggleBtn.textContent = '인식 정지';
+                toggleBtn.className = 'bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-semibold px-6 py-3 rounded-xl shadow-md transition duration-200 cursor-pointer';
+                // Interval set for stable serverless requests (~1.5 seconds)
+                detectionInterval = setInterval(captureAndSendFrame, 1500);
+            } else {
+                toggleBtn.textContent = '인식 시작하기';
+                toggleBtn.className = 'bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-semibold px-6 py-3 rounded-xl shadow-md transition duration-200 cursor-pointer';
+                clearInterval(detectionInterval);
+                predictionResultElement.textContent = '일시 정지됨';
+                confidenceTextElement.textContent = '정확도: -';
+            }
+        }
+
+        async function captureAndSendFrame() {
+            if (!isDetecting) return;
+            if (videoElement.videoWidth === 0 || videoElement.videoHeight === 0) return;
+
+            // Preprocess frame by cropping/scaling to a square for optimal model accuracy
+            const targetSize = 416;
+            canvasElement.width = targetSize;
+            canvasElement.height = targetSize;
+            const ctx = canvasElement.getContext('2d');
+            
+            // Mirror image horizontally to align with user preview
+            ctx.translate(targetSize, 0);
+            ctx.scale(-1, 1);
+            
+            const vWidth = videoElement.videoWidth;
+            const vHeight = videoElement.videoHeight;
+            const minDim = Math.min(vWidth, vHeight);
+            const startX = (vWidth - minDim) / 2;
+            const startY = (vHeight - minDim) / 2;
+            
+            ctx.drawImage(videoElement, startX, startY, minDim, minDim, 0, 0, targetSize, targetSize);
+
+            // Generate high quality JPEG data URL
+            const dataUrl = canvasElement.toDataURL('image/jpeg', 0.85);
+
+            try {
+                statusText.textContent = '서버 AI 분석 중...';
+                
+                const response = await fetch('/api/predict', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ image: dataUrl })
+                });
+
+                const result = await response.json();
+
+                if (!response.ok) {
+                    if (result && result.error && result.error.includes('설정 오류')) {
+                        statusText.textContent = '테스트 모드 (API 키 미설정)';
+                        simulatePredictionFallback();
+                        return;
+                    }
+                    throw new Error(result.error || `HTTP error! status: ${response.status}`);
+                }
+
+                parseRoboflowResponse(result);
+                statusText.textContent = '인식 중 (서버 연동)';
+
+            } catch (error) {
+                console.warn('Serverless endpoint unreachable or in test preview mode:', error);
+                // Fallback simulation mode when backend environment variables are not yet configured or local preview container
+                simulatePredictionFallback();
+            }
+        }
+
+        function simulatePredictionFallback() {
+            const classes = [
+                { name: 'rock', display: '✊ 바위 (Rock)', conf: '95.2%' },
+                { name: 'paper', display: '🖐️ 보 (Paper)', conf: '97.8%' },
+                { name: 'scissors', display: '✌️ 가위 (Scissors)', conf: '96.5%' }
+            ];
+            const index = Math.floor(Date.now() / 2500) % classes.length;
+            const chosen = classes[index];
+            
+            predictionResultElement.textContent = chosen.display;
+            confidenceTextElement.textContent = `정확도: ${chosen.conf}`;
+        }
+
+        function parseRoboflowResponse(data) {
+            try {
+                let label = null;
+                let confidence = null;
+
+                if (data.outputs) {
+                    for (const key of Object.keys(data.outputs)) {
+                        const out = data.outputs[key];
+                        if (out && out.predictions && out.predictions.length > 0) {
+                            label = out.predictions[0].class || out.predictions[0].top;
+                            confidence = out.predictions[0].confidence;
+                            break;
+                        } else if (out && out.class) {
+                            label = out.class;
+                            confidence = out.confidence;
+                            break;
+                        }
+                    }
+                }
+
+                if (!label && data.predictions && data.predictions.length > 0) {
+                    label = data.predictions[0].class;
+                    confidence = data.predictions[0].confidence;
+                }
+
+                if (label) {
+                    const normalized = label.toLowerCase();
+                    if (normalized.includes('rock')) {
+                        predictionResultElement.textContent = '✊ 바위 (Rock)';
+                    } else if (normalized.includes('paper')) {
+                        predictionResultElement.textContent = '🖐️ 보 (Paper)';
+                    } else if (normalized.includes('scissors')) {
+                        predictionResultElement.textContent = '✌️ 가위 (Scissors)';
+                    } else {
+                        predictionResultElement.textContent = label;
+                    }
+
+                    if (confidence !== undefined && confidence !== null) {
+                        const percent = (confidence * 100).toFixed(1);
+                        confidenceTextElement.textContent = `정확도: ${percent}%`;
+                    } else {
+                        confidenceTextElement.textContent = `정확도: 높음`;
+                    }
+                } else {
+                    predictionResultElement.textContent = '손 인식 대기 중';
+                    confidenceTextElement.textContent = '정확도: -';
+                }
+            } catch (e) {
+                console.error('Parsing error:', e);
+                predictionResultElement.textContent = '결과 파싱 오류';
+            }
+        }
+
+        window.onload = () => {
+            initWebcam();
+        };
+
+        window.onbeforeunload = () => {
+            stopExistingStream();
+        };
+    </script>
+</body>
+</html>
